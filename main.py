@@ -44,6 +44,36 @@ TEAM_DISPLAY = {1: (235, 130, 40), 2: (55, 55, 235)}   # BGR: blue, red
 MAX_FULL_VIDEO_GB = 8
 
 
+def available_memory_gb():
+    """Free RAM, or None when it cannot be determined on this platform."""
+    try:                                  # Linux, so Colab
+        import os as _os
+        return (_os.sysconf('SC_AVPHYS_PAGES') *
+                _os.sysconf('SC_PAGE_SIZE') / 1e9)
+    except (ValueError, AttributeError, OSError):
+        pass
+    try:                                  # Windows
+        import ctypes
+
+        class _Status(ctypes.Structure):
+            _fields_ = [('dwLength', ctypes.c_ulong),
+                        ('dwMemoryLoad', ctypes.c_ulong),
+                        ('ullTotalPhys', ctypes.c_ulonglong),
+                        ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong),
+                        ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong),
+                        ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+
+        status = _Status()
+        status.dwLength = ctypes.sizeof(_Status)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        return status.ullAvailPhys / 1e9
+    except Exception:
+        return None
+
+
 def timestamp_arg(text):
     try:
         return parse_timestamp(text)
@@ -179,11 +209,28 @@ def main():
         window = (math.floor(window[0]),
                   min(math.ceil(window[1]), math.ceil(info['duration'])))
 
+    # Size the section against this machine. The old check only ran when no
+    # section was given, so a section too large for the machine was not
+    # refused - it was killed part way through, after the inference had
+    # already been paid for.
     if window is None:
-        frames_gb = info['frame_count'] * info['width'] * info['height'] * 3 / 1e9
-        if frames_gb > MAX_FULL_VIDEO_GB:
-            sys.exit(f"Reading the whole video needs about {frames_gb:.0f} GB of memory. "
-                     "Use --random-clip or --start/--end to analyse a section.")
+        section_frames = info['frame_count']
+    else:
+        section_frames = (window[1] - window[0]) * info['fps']
+    frames_gb = section_frames * info['width'] * info['height'] * 3 / 1e9
+    budget = available_memory_gb()
+    if budget is not None and frames_gb > budget * 0.7:
+        seconds = (budget * 0.7 * 1e9 /
+                   (info['width'] * info['height'] * 3) / info['fps'])
+        sys.exit(
+            f"That section needs about {frames_gb:.0f} GB and only "
+            f"{budget:.0f} GB is free. Frames are held in memory, so the "
+            f"limit here is roughly {seconds:.0f} seconds at "
+            f"{info['width']}x{info['height']}.\n"
+            "Use a shorter --start/--end, or analyse the clip in pieces.")
+    if budget is None and frames_gb > MAX_FULL_VIDEO_GB:
+        sys.exit(f"That section needs about {frames_gb:.0f} GB of memory. "
+                 "Use a shorter --start/--end.")
 
     fps = info['fps']
     start, end = window if window else (None, None)
