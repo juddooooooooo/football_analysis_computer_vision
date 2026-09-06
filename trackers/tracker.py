@@ -24,6 +24,8 @@ class Tracker:
 
     def add_position_to_tracks(sekf,tracks):
         for object, object_tracks in tracks.items():
+            if object == 'ball_candidates':
+                continue
             for frame_num, track in enumerate(object_tracks):
                 for track_id, track_info in track.items():
                     bbox = track_info['bbox']
@@ -69,7 +71,11 @@ class Tracker:
         tracks={
             "players":[],
             "referees":[],
-            "ball":[]
+            "ball":[],
+            # Every ball-like detection, not just one. Most are clutter off
+            # the pitch; choosing between them needs the calibration, which
+            # lives a layer up, so keep them all and decide there.
+            "ball_candidates":[]
         }
 
         for frame_num, detection in enumerate(detections):
@@ -90,6 +96,7 @@ class Tracker:
             tracks["players"].append({})
             tracks["referees"].append({})
             tracks["ball"].append({})
+            tracks["ball_candidates"].append({})
 
             for frame_detection in detection_with_tracks:
                 bbox = frame_detection[0].tolist()
@@ -102,12 +109,25 @@ class Tracker:
                 if cls_id == cls_names_inv['referee']:
                     tracks["referees"][frame_num][track_id] = {"bbox":bbox}
             
-            for frame_detection in detection_supervision:
+            for index, frame_detection in enumerate(detection_supervision):
                 bbox = frame_detection[0].tolist()
+                confidence = frame_detection[2]
                 cls_id = frame_detection[3]
 
                 if cls_id == cls_names_inv['ball']:
-                    tracks["ball"][frame_num][1] = {"bbox":bbox}
+                    tracks["ball_candidates"][frame_num][index] = {
+                        "bbox": bbox,
+                        "conf": float(confidence) if confidence is not None else 0.0,
+                    }
+                    # Provisional pick, used when there is no calibration to
+                    # choose with. Highest confidence beats the previous
+                    # behaviour of keeping whichever happened to come last.
+                    best = tracks["ball"][frame_num].get(1)
+                    if best is None or float(confidence or 0.0) > best.get("conf", 0.0):
+                        tracks["ball"][frame_num][1] = {
+                            "bbox": bbox,
+                            "conf": float(confidence or 0.0),
+                        }
 
         if stub_path is not None:
             with open(stub_path,'wb') as f:

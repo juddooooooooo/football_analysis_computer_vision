@@ -36,6 +36,8 @@ class CameraMovementEstimator():
 
     def add_adjust_positions_to_tracks(self,tracks, camera_movement_per_frame):
         for object, object_tracks in tracks.items():
+            if object == 'ball_candidates':
+                continue
             for frame_num, track in enumerate(object_tracks):
                 for track_id, track_info in track.items():
                     position = track_info['position']

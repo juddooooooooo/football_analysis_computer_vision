@@ -203,6 +203,8 @@ class CalibratedTransformer:
 
     def add_transformed_position_to_tracks(self, tracks):
         for obj, object_tracks in tracks.items():
+            if obj == 'ball_candidates':
+                continue
             for frame_num, track in enumerate(object_tracks):
                 if not track:
                     continue
