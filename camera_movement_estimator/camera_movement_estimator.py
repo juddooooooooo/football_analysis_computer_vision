@@ -47,6 +47,31 @@ class CameraMovementEstimator():
                     
 
 
+    def begin_stream(self, width, height):
+        """Start accumulating movement chunk by chunk.
+
+        Same measurement as get_camera_movement, but it does not need the
+        whole clip in memory: only the previous frame is kept.
+        """
+        self._window = cv2.createHanningWindow((width, height), cv2.CV_32F)
+        self._prev = None
+        self._total = np.zeros(2)
+        self.movement = []
+
+    def feed(self, frames):
+        """Consume a chunk. Chunks must arrive in order."""
+        for frame in frames:
+            grey = np.float32(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            if self._prev is None:
+                self.movement.append([0.0, 0.0])
+            else:
+                (dx, dy), _ = cv2.phaseCorrelate(self._prev, grey, self._window)
+                self._total = self._total + np.array([dx, dy])
+                self.movement.append([float(self._total[0]),
+                                      float(self._total[1])])
+            self._prev = grey
+        return self.movement
+
     def get_camera_movement(self,frames,read_from_stub=False, stub_path=None):
         """Cumulative camera offset, in pixels, relative to the first frame.
 

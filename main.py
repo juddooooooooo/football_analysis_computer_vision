@@ -12,13 +12,15 @@ inference. Pass --no-cache to force a fresh run.
 import argparse
 import math
 import os
+import pickle
 import random
 import sys
 
 import numpy as np
 
 from utils import (read_video, save_video, probe_video, parse_timestamp,
-                   format_timestamp, resolve_window, TimestampError)
+                   format_timestamp, resolve_window, TimestampError,
+                   iter_video, count_frames, open_writer)
 from trackers import Tracker
 from team_assigner import TeamAssigner
 from player_ball_assigner import PlayerBallAssigner
@@ -42,6 +44,7 @@ SAMPLE_STUBS = ('stubs/track_stubs.pkl', 'stubs/camera_movement_stub.pkl')
 TEAM_DISPLAY = {1: (235, 130, 40), 2: (55, 55, 235)}   # BGR: blue, red
 # Raw frames above this are refused without a section (output doubles it).
 MAX_FULL_VIDEO_GB = 8
+CALIBRATION_EVERY = 10   # frames between calibration refits
 
 
 def available_memory_gb():
@@ -108,6 +111,8 @@ def parse_args():
                         help="half precision, GPU only (roughly 2x)")
     parser.add_argument('--batch', type=int, default=20,
                         help="frames per inference batch; raise it on a GPU")
+    parser.add_argument('--chunk', type=int, default=90,
+                        help="frames held in memory at once; lower it if memory is tight")
     parser.add_argument('--no-cache', action='store_true',
                         help="ignore cached detections in stubs/ and run inference again")
     parser.add_argument('--no-pitch-view', action='store_true',
@@ -156,9 +161,9 @@ def first_frame_with_players(player_tracks, minimum=2):
 
 
 def add_pitch_view(frames, tracks, calibration, scale=0.34, team_shape=True,
-                   tracked=None):
+                   tracked=None, renderer=None):
     """Composite a bird's-eye view of the tracked positions onto each frame."""
-    renderer = PitchRenderer(scale=6)
+    renderer = renderer or PitchRenderer(scale=6)
     for frame_num, frame in enumerate(frames):
         panel = renderer.blank()
         teams = {}
@@ -209,31 +214,9 @@ def main():
         window = (math.floor(window[0]),
                   min(math.ceil(window[1]), math.ceil(info['duration'])))
 
-    # Size the section against this machine. The old check only ran when no
-    # section was given, so a section too large for the machine was not
-    # refused - it was killed part way through, after the inference had
-    # already been paid for.
-    if window is None:
-        section_frames = info['frame_count']
-    else:
-        section_frames = (window[1] - window[0]) * info['fps']
-    frames_gb = section_frames * info['width'] * info['height'] * 3 / 1e9
-    budget = available_memory_gb()
-    if budget is not None and frames_gb > budget * 0.7:
-        seconds = (budget * 0.7 * 1e9 /
-                   (info['width'] * info['height'] * 3) / info['fps'])
-        sys.exit(
-            f"That section needs about {frames_gb:.0f} GB and only "
-            f"{budget:.0f} GB is free. Frames are held in memory, so the "
-            f"limit here is roughly {seconds:.0f} seconds at "
-            f"{info['width']}x{info['height']}.\n"
-            "Use a shorter --start/--end, or analyse the clip in pieces.")
-    if budget is None and frames_gb > MAX_FULL_VIDEO_GB:
-        sys.exit(f"That section needs about {frames_gb:.0f} GB of memory. "
-                 "Use a shorter --start/--end.")
-
     fps = info['fps']
     start, end = window if window else (None, None)
+    n_expected = count_frames(args.video, start, end)
     track_stub, camera_stub = stub_paths(args.video, window, args.imgsz)
     output_path = args.output or f"output_videos/{section_label(args.video, window)}.avi"
     os.makedirs('stubs', exist_ok=True)
@@ -244,72 +227,120 @@ def main():
           f"{format_timestamp(info['duration'])} long")
     if window:
         print(f"Section: {format_timestamp(start)} to {format_timestamp(end)} ({end - start}s)")
-    if use_cache and os.path.exists(track_stub):
-        print(f"Using cached detections: {track_stub}")
+    if n_expected <= 0:
+        sys.exit("That section contains no frames.")
+    per_frame = info['width'] * info['height'] * 3 / 1e9
+    print(f"{n_expected} frames, streamed {args.chunk} at a time: "
+          f"{args.chunk * per_frame:.2f} GB held rather than "
+          f"{n_expected * per_frame:.1f} GB")
 
-    # Read Video
-    video_frames = read_video(args.video, start, end)
-    if not video_frames:
-        sys.exit("No frames could be read from that section.")
-    print(f"Loaded {len(video_frames)} frames")
-
-    # Initialize Tracker
     tracker = Tracker(args.model, device=args.device, imgsz=args.imgsz,
                       half=args.half, batch_size=args.batch)
-
-    tracks = tracker.get_object_tracks(video_frames,
-                                       read_from_stub=use_cache,
-                                       stub_path=track_stub)
-    # Get object positions
-    # Lift the candidate list out before anything else walks `tracks`: every
-    # consumer iterates it generically and would trip over entries that have
-    # no position of their own.
-    ball_candidates = tracks.pop('ball_candidates', None)
-
-    tracker.add_position_to_tracks(tracks)
-
-    # camera movement estimator
-    camera_movement_estimator = CameraMovementEstimator(video_frames[0])
-    camera_movement_per_frame = camera_movement_estimator.get_camera_movement(video_frames,
-                                                                                read_from_stub=use_cache,
-                                                                                stub_path=camera_stub)
-    camera_movement_estimator.add_adjust_positions_to_tracks(tracks,camera_movement_per_frame)
-
-
-    # View transformer: a fitted homography for this clip when we have one.
     calibration = pitch_calibration.load(args.video, window)
+
+    cached_tracks = use_cache and os.path.exists(track_stub)
+    cached_camera = use_cache and os.path.exists(camera_stub)
+    if cached_tracks:
+        print(f"Using cached detections: {track_stub}")
+        with open(track_stub, 'rb') as handle:
+            tracks = pickle.load(handle)
+    else:
+        tracks = tracker.new_tracks()
+    camera_movement = None
+    if cached_camera:
+        with open(camera_stub, 'rb') as handle:
+            camera_movement = pickle.load(handle)
+
     if calibration is not None:
         print(f"Calibration: {calibration.error:.2f}px mean line alignment")
-        tracked = None
-        if args.no_track_calibration:
-            transformer = CalibratedTransformer(calibration)
-        else:
-            # A pan changes perspective, which no translation can undo, so
-            # re-fit periodically through the clip rather than trusting the
-            # opening frame all the way to the end.
-            tracked = pitch_calibration.track(video_frames, calibration)
-            errs = [c.error for c in tracked if c.error is not None]
-            if errs:
-                print(f"Tracked calibration across the clip: "
-                      f"{np.mean(errs):.2f}px mean, {max(errs):.2f}px worst")
-            calibration = tracked[0]
-            transformer = CalibratedTransformer(tracked)
     else:
-        print("No calibration for this clip. Speed, distance and the pitch "
-              "view need one - without it ViewTransformer's built-in "
-              "coordinates apply, which belong to a different camera.\n"
+        print("No calibration for this clip. Speed, distance, the pitch view "
+              "and the ball filter all need one - without it ViewTransformer's "
+              "built-in coordinates apply, which belong to a different camera.\n"
               f'  python -m pitch_calibration.interactive "{args.video}"'
               + (f' --start {format_timestamp(start)} --end {format_timestamp(end)}'
                  if window else ''))
-        tracked = None
+
+    # ---- First pass: everything that has to look at the frames.
+    # Detection, camera movement, calibration refits and kit colours are all
+    # gathered in one sweep, so the clip is decoded twice in total rather
+    # than being held in memory for its whole length.
+    follow = calibration is not None and not args.no_track_calibration
+    estimator = None
+    calib_keys, last_key = {}, None
+    team_assigner = TeamAssigner()
+    team_ready = False
+    seen = 0
+
+    for chunk in iter_video(args.video, start, end, chunk=args.chunk):
+        if estimator is None:
+            estimator = CameraMovementEstimator(chunk[0])
+            if camera_movement is None:
+                estimator.begin_stream(chunk[0].shape[1], chunk[0].shape[0])
+        if not cached_tracks:
+            tracker.track_chunk(chunk, tracks)
+        if camera_movement is None:
+            estimator.feed(chunk)
+
+        for offset, frame in enumerate(chunk):
+            index = seen + offset
+            if index >= len(tracks['players']):
+                break
+            if follow and index % CALIBRATION_EVERY == 0:
+                seed = calib_keys[last_key] if last_key is not None else calibration
+                calib_keys[index] = pitch_calibration.refine_from(frame, seed)
+                last_key = index
+            players = tracks['players'][index]
+            if not team_ready and len(players) >= 2:
+                team_assigner.assign_team_color(frame, players)
+                team_ready = True
+            if team_ready:
+                for player_id, track in players.items():
+                    team_assigner.get_player_team(frame, track['bbox'], player_id)
+
+        seen += len(chunk)
+        print(f"  pass 1: {min(seen, n_expected)}/{n_expected} frames",
+              end='\r', flush=True)
+    print()
+
+    if estimator is None:
+        sys.exit("No frames could be read from that section.")
+    n_frames = len(tracks['players'])
+    if camera_movement is None:
+        camera_movement = estimator.movement
+        with open(camera_stub, 'wb') as handle:
+            pickle.dump(camera_movement, handle)
+    if not cached_tracks:
+        with open(track_stub, 'wb') as handle:
+            pickle.dump(tracks, handle)
+    if not team_ready:
+        sys.exit("No frame had two players in it; nothing to analyse.")
+
+    # ---- From here to the second pass everything works on the tracks alone,
+    # which stay a few megabytes however long the clip is.
+    ball_candidates = tracks.pop('ball_candidates', None)
+    tracker.add_position_to_tracks(tracks)
+    estimator.add_adjust_positions_to_tracks(tracks, camera_movement)
+
+    tracked = None
+    if calibration is not None and follow:
+        tracked = pitch_calibration.interpolate(calib_keys, n_frames,
+                                                calibration.image_size)
+        errors = [c.error for c in calib_keys.values() if c.error is not None]
+        if errors:
+            print(f"Tracked calibration: {np.mean(errors):.2f}px mean, "
+                  f"{max(errors):.2f}px worst over {len(calib_keys)} refits")
+        calibration = tracked[0]
+        transformer = CalibratedTransformer(tracked)
+    elif calibration is not None:
+        transformer = CalibratedTransformer(calibration)
+    else:
         transformer = ViewTransformer()
     transformer.add_transformed_position_to_tracks(tracks)
 
     # Pick the real ball out of the candidates. Most ball-like detections are
-    # clutter beside the pitch - water bottles and kit on the grass past the
-    # touchline - and the calibration is what tells them apart. On one 180
-    # frame sample this removed 47 of 152 picks and took physically
-    # impossible frame-to-frame jumps from 69 down to zero.
+    # clutter beside the pitch - bottles and kit on the grass past the
+    # touchline - and the calibration is what tells them apart.
     if ball_candidates and calibration is not None:
         selector = BallTracker(fps)
         chosen, raw = [], 0
@@ -331,78 +362,76 @@ def main():
               f"after discarding everything outside the lines")
         tracks['ball'] = chosen
 
-    # Interpolate Ball Positions
     tracks["ball"] = tracker.interpolate_ball_positions(tracks["ball"])
 
-    # Speed and distance estimator
     speed_and_distance_estimator = SpeedAndDistance_Estimator(frame_rate=fps)
     speed_and_distance_estimator.add_speed_and_distance_to_tracks(tracks)
 
-    # Assign Player Teams
-    colour_frame = first_frame_with_players(tracks['players'])
-    if colour_frame is None:
-        sys.exit("No frame with at least two players detected; nothing to analyse. "
-                 "Try another section, or --no-cache if the cached detections are stale.")
-    team_assigner = TeamAssigner()
-    team_assigner.assign_team_color(video_frames[colour_frame],
-                                    tracks['players'][colour_frame])
-
+    # Teams were decided in the first pass while the frames were in hand;
+    # writing them onto the tracks needs no frames at all.
     if not args.kit_colours:
-        for team, drawn in TEAM_DISPLAY.items():
+        for team in TEAM_DISPLAY:
             kit = np.round(team_assigner.team_colors[team]).astype(int).tolist()
             name = {1: 'blue', 2: 'red'}[team]
             print(f"  team {team} drawn {name}; detected kit colour BGR {kit}")
-
-    for frame_num, player_track in enumerate(tracks['players']):
+    for player_track in tracks['players']:
         for player_id, track in player_track.items():
-            team = team_assigner.get_player_team(video_frames[frame_num],
-                                                 track['bbox'],
-                                                 player_id)
-            tracks['players'][frame_num][player_id]['team'] = team
-            tracks['players'][frame_num][player_id]['team_color'] = (
-                team_assigner.team_colors[team] if args.kit_colours
-                else TEAM_DISPLAY.get(team, (230, 230, 230)))
+            team = team_assigner.player_team_dict.get(player_id, 1)
+            track['team'] = team
+            track['team_color'] = (team_assigner.team_colors[team]
+                                   if args.kit_colours
+                                   else TEAM_DISPLAY.get(team, (230, 230, 230)))
 
-
-    # Assign Ball Aquisition
-    player_assigner =PlayerBallAssigner()
-    team_ball_control= []
+    player_assigner = PlayerBallAssigner()
+    team_ball_control = []
     for frame_num, player_track in enumerate(tracks['players']):
-        ball_bbox = tracks['ball'][frame_num][1]['bbox']
-        assigned_player = player_assigner.assign_ball_to_player(player_track, ball_bbox)
-
+        ball_bbox = tracks['ball'][frame_num].get(1, {}).get('bbox')
+        assigned_player = -1
+        if ball_bbox is not None and np.all(np.isfinite(ball_bbox)):
+            assigned_player = player_assigner.assign_ball_to_player(player_track,
+                                                                    ball_bbox)
         if assigned_player != -1:
             tracks['players'][frame_num][assigned_player]['has_ball'] = True
-            team_ball_control.append(tracks['players'][frame_num][assigned_player]['team'])
+            team_ball_control.append(
+                tracks['players'][frame_num][assigned_player]['team'])
         else:
-            # 0 = nobody yet; the overlay shows 0% until the first possession.
-            team_ball_control.append(team_ball_control[-1] if team_ball_control else 0)
-    team_ball_control= np.array(team_ball_control)
+            team_ball_control.append(team_ball_control[-1]
+                                     if team_ball_control else 1)
+    team_ball_control = np.array(team_ball_control)
 
+    # ---- Second pass: draw each chunk and write it straight out, so the
+    # annotated frames are never all in memory either.
+    writer = open_writer(output_path, fps, info['width'], info['height'])
+    renderer = PitchRenderer(scale=6) if calibration is not None else None
+    seen = 0
+    try:
+        for chunk in iter_video(args.video, start, end, chunk=args.chunk):
+            high = min(seen + len(chunk), n_frames)
+            if high <= seen:
+                break
+            chunk = chunk[:high - seen]
+            piece = {key: value[seen:high] for key, value in tracks.items()}
 
-    # Draw output
-    ## Draw object Tracks
-    output_video_frames = tracker.draw_annotations(video_frames, tracks,
-                                                   team_ball_control,
-                                                   in_place=True)
-
-    ## Draw Camera movement
-    output_video_frames = camera_movement_estimator.draw_camera_movement(
-        output_video_frames, camera_movement_per_frame, in_place=True)
-
-    ## Draw Speed and Distance
-    speed_and_distance_estimator.draw_speed_and_distance(output_video_frames,tracks)
-
-    ## Draw the 2D pitch view
-    if calibration is not None and not args.no_pitch_view:
-        output_video_frames = add_pitch_view(
-            output_video_frames, tracks, calibration,
-            scale=args.pitch_view_scale, team_shape=not args.no_team_shape,
-            tracked=None if args.no_track_calibration else tracked)
-
-    # Save video
-    save_video(output_video_frames, output_path, fps=fps)
+            frames = tracker.draw_annotations(chunk, piece, team_ball_control,
+                                              in_place=True, offset=seen)
+            frames = estimator.draw_camera_movement(
+                frames, camera_movement[seen:high], in_place=True)
+            speed_and_distance_estimator.draw_speed_and_distance(frames, piece)
+            if calibration is not None and not args.no_pitch_view:
+                add_pitch_view(frames, piece, calibration,
+                               scale=args.pitch_view_scale,
+                               team_shape=not args.no_team_shape,
+                               tracked=tracked[seen:high] if tracked else None,
+                               renderer=renderer)
+            for frame in frames:
+                writer.write(frame)
+            seen = high
+            print(f"  pass 2: {seen}/{n_frames} frames", end='\r', flush=True)
+    finally:
+        writer.release()
+    print()
     print(f"Saved: {output_path}")
+
 
 if __name__ == '__main__':
     main()

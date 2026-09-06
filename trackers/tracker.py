@@ -59,12 +59,90 @@ class Tracker:
                                              **kwargs)
         return detections
 
+    @staticmethod
+    def new_tracks():
+        return {
+            "players": [],
+            "referees": [],
+            "ball": [],
+            # Every ball-like detection, not just one. Most are clutter off
+            # the pitch; choosing between them needs the calibration, which
+            # lives a layer up, so keep them all and decide there.
+            "ball_candidates": [],
+        }
+
+    def absorb(self, detection, tracks):
+        """Fold one frame's detections into tracks, appending a frame."""
+        cls_names = detection.names
+        cls_names_inv = {v: k for k, v in cls_names.items()}
+
+        # Convert to supervision Detection format
+        detection_supervision = sv.Detections.from_ultralytics(detection)
+
+        # Convert GoalKeeper to player object
+        for object_ind, class_id in enumerate(detection_supervision.class_id):
+            if cls_names[class_id] == "goalkeeper":
+                detection_supervision.class_id[object_ind] = cls_names_inv["player"]
+
+        # Track Objects
+        detection_with_tracks = self.tracker.update_with_detections(detection_supervision)
+
+        players, referees, ball, candidates = {}, {}, {}, {}
+
+        for frame_detection in detection_with_tracks:
+            bbox = frame_detection[0].tolist()
+            cls_id = frame_detection[3]
+            track_id = frame_detection[4]
+
+            if cls_id == cls_names_inv['player']:
+                players[track_id] = {"bbox": bbox}
+
+            if cls_id == cls_names_inv['referee']:
+                referees[track_id] = {"bbox": bbox}
+
+        for index, frame_detection in enumerate(detection_supervision):
+            bbox = frame_detection[0].tolist()
+            confidence = frame_detection[2]
+            cls_id = frame_detection[3]
+
+            if cls_id == cls_names_inv['ball']:
+                conf = float(confidence) if confidence is not None else 0.0
+                candidates[index] = {"bbox": bbox, "conf": conf}
+                # Provisional pick, used when there is no calibration to
+                # choose with. Highest confidence beats the previous
+                # behaviour of keeping whichever happened to come last.
+                if not ball or conf > ball[1].get("conf", 0.0):
+                    ball[1] = {"bbox": bbox, "conf": conf}
+
+        tracks["players"].append(players)
+        tracks["referees"].append(referees)
+        tracks["ball"].append(ball)
+        tracks["ball_candidates"].append(candidates)
+
+    def track_chunk(self, frames, tracks):
+        """Detect and track a chunk of frames, appending to tracks.
+
+        Lets a long clip be processed without holding it in memory. ByteTrack
+        carries its state between calls, so chunks must arrive in order.
+        """
+        for detection in self.detect_frames(frames):
+            self.absorb(detection, tracks)
+
     def get_object_tracks(self, frames, read_from_stub=False, stub_path=None):
-        
+
         if read_from_stub and stub_path is not None and os.path.exists(stub_path):
             with open(stub_path,'rb') as f:
                 tracks = pickle.load(f)
             return tracks
+
+        tracks = self.new_tracks()
+        self.track_chunk(frames, tracks)
+
+        if stub_path is not None:
+            with open(stub_path,'wb') as f:
+                pickle.dump(tracks,f)
+
+        return tracks
 
         detections = self.detect_frames(frames)
 
@@ -223,8 +301,12 @@ class Tracker:
         return frame
 
     def draw_annotations(self,video_frames, tracks,team_ball_control,
-                         in_place=False):
+                         in_place=False, offset=0):
         """Annotate every frame.
+
+        offset is where these frames sit in the clip, so that a chunk can be
+        drawn on its own while the possession figures still count from the
+        beginning rather than from the start of the chunk.
 
         in_place draws onto the frames given rather than onto copies. The
         copies double peak memory, and with the camera-movement pass doing
@@ -257,7 +339,7 @@ class Tracker:
 
 
             # Draw Team Ball Control
-            frame = self.draw_team_ball_control(frame, frame_num, team_ball_control)
+            frame = self.draw_team_ball_control(frame, frame_num + offset, team_ball_control)
 
             output_video_frames.append(frame)
 

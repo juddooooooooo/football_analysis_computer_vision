@@ -255,6 +255,44 @@ def _anchors_for(H, shape, want=6):
     return pts[chosen], _CANDIDATES[chosen]
 
 
+def refine_from(frame, calibration, max_shift=35.0):
+    """Re-fit onto this frame, seeded from an existing calibration.
+
+    Anchors are derived from the seed rather than clicked again, so this can
+    follow a camera through a clip without any manual input.
+    """
+    img_a, wld_a = _anchors_for(calibration.H_pitch_to_image, frame.shape[:2])
+    if img_a is None:
+        return calibration
+    try:
+        H, err, _ = refine(frame, img_a, wld_a, max_shift=max_shift)
+    except ValueError:
+        return calibration
+    return Calibration(H, calibration.image_size, err)
+
+
+def interpolate(keys, n_frames, image_size=None):
+    """Expand {frame index: Calibration} to one Calibration per frame."""
+    if not keys:
+        raise ValueError("No keyframe calibrations to interpolate from.")
+    marks = sorted(keys)
+    out = []
+    for i in range(n_frames):
+        hi = np.searchsorted(marks, i, side='left')
+        if hi == 0 or marks[min(hi, len(marks) - 1)] == i:
+            mark = marks[min(hi, len(marks) - 1)]
+            H_i, err = keys[mark].H_pitch_to_image, keys[mark].error
+        else:
+            a, b = marks[hi - 1], marks[min(hi, len(marks) - 1)]
+            t = 0.0 if b == a else (i - a) / (b - a)
+            H_i = ((1 - t) * keys[a].H_pitch_to_image
+                   + t * keys[b].H_pitch_to_image)
+            H_i = H_i / H_i[2, 2]
+            err = keys[b].error
+        out.append(Calibration(H_i, image_size, err))
+    return out
+
+
 def track(frames, calibration, every=10, max_shift=35.0, report=None):
     """A calibration per frame, for a camera that pans during the clip.
 
