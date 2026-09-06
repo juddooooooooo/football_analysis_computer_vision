@@ -78,11 +78,12 @@ class CameraMovementEstimator():
 
         return camera_movement
     
-    def draw_camera_movement(self,frames, camera_movement_per_frame):
+    def draw_camera_movement(self,frames, camera_movement_per_frame,
+                             in_place=False):
         output_frames=[]
 
         for frame_num, frame in enumerate(frames):
-            frame= frame.copy()
+            frame = frame if in_place else frame.copy()
 
             overlay = frame.copy()
             cv2.rectangle(overlay,(0,0),(500,100),(255,255,255),-1)

@@ -301,10 +301,13 @@ def main():
 
     # Draw output
     ## Draw object Tracks
-    output_video_frames = tracker.draw_annotations(video_frames, tracks,team_ball_control)
+    output_video_frames = tracker.draw_annotations(video_frames, tracks,
+                                                   team_ball_control,
+                                                   in_place=True)
 
     ## Draw Camera movement
-    output_video_frames = camera_movement_estimator.draw_camera_movement(output_video_frames,camera_movement_per_frame)
+    output_video_frames = camera_movement_estimator.draw_camera_movement(
+        output_video_frames, camera_movement_per_frame, in_place=True)
 
     ## Draw Speed and Distance
     speed_and_distance_estimator.draw_speed_and_distance(output_video_frames,tracks)

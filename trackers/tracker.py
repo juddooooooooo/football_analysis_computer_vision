@@ -202,10 +202,18 @@ class Tracker:
 
         return frame
 
-    def draw_annotations(self,video_frames, tracks,team_ball_control):
+    def draw_annotations(self,video_frames, tracks,team_ball_control,
+                         in_place=False):
+        """Annotate every frame.
+
+        in_place draws onto the frames given rather than onto copies. The
+        copies double peak memory, and with the camera-movement pass doing
+        the same thing a 20s 1080p clip needs about 11GB, which is more than
+        a free Colab instance has.
+        """
         output_video_frames= []
         for frame_num, frame in enumerate(video_frames):
-            frame = frame.copy()
+            frame = frame if in_place else frame.copy()
 
             player_dict = tracks["players"][frame_num]
             ball_dict = tracks["ball"][frame_num]
