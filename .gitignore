@@ -1,0 +1,33 @@
+# Media and weights: far too large for git, and easy to re-fetch.
+input_videos/*
+!input_videos/put_input_video_here.txt
+output_videos/*
+!output_videos/screenshot.png
+models/*
+!models/put_models_here.txt
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.part
+*.pt
+*.onnx
+
+# Cached detections: reproducible, and keyed to a specific video and imgsz.
+stubs/*
+!stubs/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Local tooling
+.claude/
+.vscode/
+.DS_Store
+
+# Windows / OneDrive artefacts
+desktop.ini
+Thumbs.db
